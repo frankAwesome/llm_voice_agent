@@ -34,28 +34,44 @@ import threading
 import queue
 from pathlib import Path
 
-# Configuration
-WHISPER_MODEL = "base"  # Options: tiny, base, small, medium, large-v3
-OLLAMA_MODEL = "llama3"
+# Configuration - loaded from config.json
+CONFIG_FILE = Path(__file__).parent / "config.json"
+
+def load_config():
+    """Load configuration from config.json."""
+    default_config = {
+        "butler_name": "Susan",
+        "wake_word_required": True,
+        "system_prompt": "You are {name}, a witty English butler. Respond in 1-2 sentences MAX.",
+        "ollama_model": "llama3",
+        "whisper_model": "base",
+        "max_tokens": 75
+    }
+    
+    if CONFIG_FILE.exists():
+        try:
+            import json
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                # Merge with defaults
+                default_config.update(config)
+        except Exception as e:
+            print(f"⚠️  Error loading config: {e}")
+    
+    return default_config
+
+CONFIG = load_config()
+WHISPER_MODEL = CONFIG["whisper_model"]
+OLLAMA_MODEL = CONFIG["ollama_model"]
 OLLAMA_URL = "http://localhost:11434/api/generate"
-SILENCE_THRESHOLD = 500  # Adjusted for int16 audio
-SILENCE_DURATION = 1.5  # Seconds of silence to stop recording
+SILENCE_THRESHOLD = 500
+SILENCE_DURATION = 1.5
 
-# Butler Personality
-BUTLER_NAME = "Susan"
-SYSTEM_PROMPT = """You are Susan, a witty English butler with dry humor and impeccable manners.
-
-CRITICAL RULE: Respond in 1-2 sentences MAXIMUM. Be brief! This is for voice output.
-
-Style:
-- Use butler phrases: "Very good", "Indeed", "If I may be so bold..."
-- Helpful first, witty second
-- One quick quip max, then stop
-
-Examples of good length:
-- The weather in London is 15 degrees and cloudy, sir. Rather typical.
-- Very good. I shall set a timer for 5 minutes.
-- Indeed, 2 plus 2 is 4. Even the scullery maid knows that one."""
+# Butler Personality from config
+BUTLER_NAME = CONFIG["butler_name"]
+WAKE_WORD_REQUIRED = CONFIG["wake_word_required"]
+SYSTEM_PROMPT = CONFIG["system_prompt"].replace("{name}", BUTLER_NAME)
+MAX_TOKENS = CONFIG["max_tokens"]
 
 # Audio settings (will be auto-detected)
 SAMPLE_RATE = 44100  # Volt 2 uses 44100Hz
@@ -379,17 +395,29 @@ def query_ollama(prompt, conversation_history):
     """Send prompt to Ollama and get streaming response."""
     print(f"🎩 {BUTLER_NAME} is pondering...")
     
+    # Check if user wants a detailed answer
+    detail_keywords = ['explain', 'detail', 'elaborate', 'tell me more', 'extensive', 
+                       'in depth', 'longer', 'full answer', 'more info', 'describe fully']
+    wants_detail = any(kw in prompt.lower() for kw in detail_keywords)
+    tokens = MAX_TOKENS * 4 if wants_detail else MAX_TOKENS  # 300 vs 75 tokens
+    
     # Build context from history
     context = "\n".join([
         f"User: {h['user']}\n{BUTLER_NAME}: {h['assistant']}" 
         for h in conversation_history[-5:]  # Last 5 exchanges
     ])
     
+    # Adjust system prompt if detailed answer requested
+    if wants_detail:
+        sys_prompt = SYSTEM_PROMPT.replace("1-2 sentences MAX", "a detailed answer (3-5 sentences)")
+    else:
+        sys_prompt = SYSTEM_PROMPT
+    
     # Include system prompt for personality
     if context:
-        full_prompt = f"{SYSTEM_PROMPT}\n\nConversation so far:\n{context}\n\nUser: {prompt}\n{BUTLER_NAME}:"
+        full_prompt = f"{sys_prompt}\n\nConversation so far:\n{context}\n\nUser: {prompt}\n{BUTLER_NAME}:"
     else:
-        full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {prompt}\n{BUTLER_NAME}:"
+        full_prompt = f"{sys_prompt}\n\nUser: {prompt}\n{BUTLER_NAME}:"
     
     try:
         response = requests.post(
@@ -400,7 +428,7 @@ def query_ollama(prompt, conversation_history):
                 "stream": True,
                 "options": {
                     "temperature": 0.7,
-                    "num_predict": 75  # 1-2 sentences max for voice
+                    "num_predict": tokens
                 }
             },
             stream=True,
@@ -611,6 +639,21 @@ def main():
             if not user_text:
                 print("🤷 Couldn't understand that, try again...")
                 continue
+            
+            # Check for wake word if required
+            if WAKE_WORD_REQUIRED:
+                if BUTLER_NAME.lower() not in user_text.lower():
+                    print(f"💤 (No wake word '{BUTLER_NAME}' detected, ignoring)")
+                    continue
+                # Remove wake word from query for cleaner processing
+                import re
+                user_text = re.sub(rf'\b{BUTLER_NAME}\b[,\s]*', '', user_text, flags=re.IGNORECASE).strip()
+                if not user_text:
+                    # Just said the name with nothing else
+                    response = "Yes? How may I assist you?"
+                    print(f"🎩 {BUTLER_NAME}: {response}")
+                    speak_text_piper(response)
+                    continue
             
             # Check for commands
             if user_text.lower() in ["quit", "exit", "bye", "goodbye"]:
